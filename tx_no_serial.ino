@@ -5,77 +5,51 @@
 #define DAC_Q A13
 #define SYNC_PIN A7
 
-// =====================
-// PARAMETERS
-// =====================
-
 const int QAM = 64;
 const int SQRT_QAM = 8;
 
 const int UPS = 8;
+const int N_SYMBOLS = 1000;
+const int N_POINTS = N_SYMBOLS * UPS;   // 8000 amostras/frame
+
 const float alpha = 0.4f;
 const int Ntaps = 10 * UPS + 1;
-
-const int N_POINTS = 2000;
 
 const float sigma = 15.0f;
 const float n_target = 10.0f;
 
-const float SYMBOL_RATE = 300.0f;
-const float SAMPLE_RATE = SYMBOL_RATE * UPS;   // 2400 amostras/s
+const float SYMBOL_RATE = 4627.0f;
+const float SAMPLE_RATE = SYMBOL_RATE * UPS;
 const unsigned long SAMPLE_PERIOD_US =
   (unsigned long)(1000000.0f / SAMPLE_RATE);
 
-const unsigned long SYNC_PULSE_US = 50;
-
-// =====================
-// CONSTELLATION
-// =====================
+const unsigned long SYNC_PULSE_US = 9;
 
 float valuesI[QAM];
 float valuesQ[QAM];
 float probs[QAM];
 float cdf[QAM];
-
-// =====================
-// RRC
-// =====================
-
 float rrc[Ntaps];
-
-// =====================
-// PRECOMPUTED OUTPUT
-// =====================
 
 float seqI[N_POINTS];
 float seqQ[N_POINTS];
 uint16_t dacSeqI[N_POINTS];
 uint16_t dacSeqQ[N_POINTS];
 
-// =====================
-// CONTROL
-// =====================
+// Símbolos originais da constelação (antes de upsampling e RRC)
+float symbolsI[N_SYMBOLS];
+float symbolsQ[N_SYMBOLS];
 
-int pointIndex = 0;
+volatile int pointIndex = 0;
 unsigned long nextSampleTime = 0;
-
-// =====================
-// SAMPLE SYMBOL (MB)
-// =====================
 
 int sampleSymbolMB() {
   float u = (float)random(0, 1000000) / 1000000.0f;
-
   for (int i = 0; i < QAM; i++) {
     if (u <= cdf[i]) return i;
   }
-
   return QAM - 1;
 }
-
-// =====================
-// INIT CONSTELLATION
-// =====================
 
 void initConstellationMB() {
   float levels[SQRT_QAM];
@@ -100,9 +74,7 @@ void initConstellationMB() {
     sum += probs[i];
   }
 
-  for (int i = 0; i < QAM; i++) {
-    probs[i] /= sum;
-  }
+  for (int i = 0; i < QAM; i++) probs[i] /= sum;
 
   float n_base = 0.0f;
   for (int i = 0; i < QAM; i++) {
@@ -111,7 +83,6 @@ void initConstellationMB() {
   }
 
   float scale = sqrtf(n_target / n_base);
-
   for (int i = 0; i < QAM; i++) {
     valuesI[i] *= scale;
     valuesQ[i] *= scale;
@@ -122,13 +93,8 @@ void initConstellationMB() {
     acc += probs[i];
     cdf[i] = acc;
   }
-
   cdf[QAM - 1] = 1.0f;
 }
-
-// =====================
-// INIT RRC
-// =====================
 
 void initRRC() {
   const float T = (float)UPS;
@@ -158,63 +124,32 @@ void initRRC() {
   }
 
   float energy = 0.0f;
-  for (int i = 0; i < Ntaps; i++) {
-    energy += rrc[i] * rrc[i];
-  }
-
+  for (int i = 0; i < Ntaps; i++) energy += rrc[i] * rrc[i];
   energy = sqrtf(energy);
-
-  for (int i = 0; i < Ntaps; i++) {
-    rrc[i] /= energy;
-  }
+  for (int i = 0; i < Ntaps; i++) rrc[i] /= energy;
 }
 
-// =====================
-// FILTER
-// =====================
-
 float filterSample(float *delay, float x) {
-  for (int i = Ntaps - 1; i > 0; i--) {
-    delay[i] = delay[i - 1];
-  }
-
+  for (int i = Ntaps - 1; i > 0; i--) delay[i] = delay[i - 1];
   delay[0] = x;
 
   float y = 0.0f;
-  for (int i = 0; i < Ntaps; i++) {
-    y += delay[i] * rrc[i];
-  }
-
+  for (int i = 0; i < Ntaps; i++) y += delay[i] * rrc[i];
   return y;
 }
 
-// =====================
-// MAP TO DAC
-// =====================
-
 uint16_t mapDAC(float x, float maxAbs) {
   float y = (x + maxAbs) * (4095.0f / (2.0f * maxAbs));
-
   if (y < 0.0f) y = 0.0f;
   if (y > 4095.0f) y = 4095.0f;
-
   return (uint16_t)y;
 }
-
-// =====================
-// PRECOMPUTE WHOLE SIGNAL
-// =====================
 
 void buildSequence() {
   float delayI[Ntaps] = {0};
   float delayQ[Ntaps] = {0};
 
-  static float symbolsI[N_POINTS / UPS + 2];
-  static float symbolsQ[N_POINTS / UPS + 2];
-
-  int nSymbols = (N_POINTS + UPS - 1) / UPS;
-
-  for (int s = 0; s < nSymbols; s++) {
+  for (int s = 0; s < N_SYMBOLS; s++) {
     int idx = sampleSymbolMB();
     symbolsI[s] = valuesI[idx];
     symbolsQ[s] = valuesQ[idx];
@@ -247,17 +182,76 @@ void buildSequence() {
   }
 }
 
-// =====================
-// SETUP
-// =====================
+void restartFrame() {
+  noInterrupts();
+  pointIndex = 0;
+  nextSampleTime = micros();
+  interrupts();
+  Serial.println("TX_FRAME_RESTARTED");
+}
+
+void rebuildAndRestartFrame() {
+  buildSequence();
+  restartFrame();
+  Serial.println("TX_FRAME_REBUILT");
+}
+
+void dumpWaveform() {
+  Serial.println("BEGIN");
+  for (int i = 0; i < N_POINTS; i++) {
+    Serial.print(dacSeqI[i]);
+    Serial.print(',');
+    Serial.println(dacSeqQ[i]);
+    if ((i % 64) == 63) delay(1);
+  }
+  Serial.println("END");
+}
+
+void dumpSymbols() {
+  Serial.println("SYM_BEGIN");
+  for (int i = 0; i < N_SYMBOLS; i++) {
+    Serial.print(symbolsI[i], 6);
+    Serial.print(',');
+    Serial.println(symbolsQ[i], 6);
+    if ((i % 64) == 63) delay(1);
+  }
+  Serial.println("SYM_END");
+}
+
+void handleSerial() {
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == 'r' || c == 'R') {
+      restartFrame();
+    }
+    else if (c == 'n' || c == 'N') {
+      rebuildAndRestartFrame();
+    }
+    else if (c == 'd' || c == 'D') {
+      dumpWaveform();
+    }
+    else if (c == 's' || c == 'S') {
+      dumpSymbols();
+    }
+    else if (c == 'i' || c == 'I') {
+      Serial.print("UPS=");
+      Serial.print(UPS);
+      Serial.print(" N_SYMBOLS=");
+      Serial.print(N_SYMBOLS);
+      Serial.print(" N_POINTS=");
+      Serial.println(N_POINTS);
+    }
+  }
+}
 
 void setup() {
-  analogWriteResolution(12);
+  Serial.begin(115200);
 
+  analogWriteResolution(12);
   pinMode(DAC_I, OUTPUT);
   pinMode(DAC_Q, OUTPUT);
   pinMode(SYNC_PIN, OUTPUT);
-
   digitalWrite(SYNC_PIN, LOW);
 
   randomSeed(analogRead(A0) + micros());
@@ -266,19 +260,16 @@ void setup() {
   initRRC();
   buildSequence();
 
-  delay(2000);   // tempo para RX/PC arrancarem
+  delay(1000);
   nextSampleTime = micros();
+  Serial.println("TX_READY");
 }
 
-// =====================
-// LOOP
-// =====================
-
 void loop() {
+  handleSerial();
+
   unsigned long now = micros();
-  if ((long)(now - nextSampleTime) < 0) {
-    return;
-  }
+  if ((long)(now - nextSampleTime) < 0) return;
 
   analogWrite(DAC_I, dacSeqI[pointIndex]);
   analogWrite(DAC_Q, dacSeqQ[pointIndex]);
@@ -288,9 +279,7 @@ void loop() {
   digitalWrite(SYNC_PIN, LOW);
 
   pointIndex++;
-  if (pointIndex >= N_POINTS) {
-    pointIndex = 0;   // loop contínuo do frame
-  }
+  if (pointIndex >= N_POINTS) pointIndex = 0;
 
   nextSampleTime += SAMPLE_PERIOD_US;
 }
