@@ -18,8 +18,8 @@ def safe_std(x):
 # CONFIG
 # ========================================================
 
-TX_PORT = "COM7"
-RX_PORT = "COM5"
+TX_PORT = "COM4"
+RX_PORT = "COM3"
 BAUD = 115200
 
 UPS = 8
