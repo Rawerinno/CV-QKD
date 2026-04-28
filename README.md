@@ -1,2 +1,2 @@
 # CV-QKD
-Repositório para projeto de licenciatura LEC
+Repositório para projeto de LEC
